@@ -1,0 +1,254 @@
+import os, json, threading, random, string
+from datetime import datetime, timedelta
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
+from flask import Flask
+
+# ============ الاعدادات - غيرها من Render ============
+TOKEN = os.environ.get("BOT_TOKEN")
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "7145036494"))
+CHANNEL_ID = os.environ.get("CHANNEL_ID", "@YourChannelUsername")
+CHANNEL_LINK = os.environ.get("CHANNEL_LINK", "https://t.me/+l20CWCyobz5mZDdk")
+DATA_FILE = "database.json"
+
+if not TOKEN:
+    print("❌ BOT_TOKEN ناقص!")
+
+# ============ قاعدة البيانات ============
+USERS = {}
+FILES = {}
+
+def load_data():
+    global USERS, FILES
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                USERS = data.get("users", {}) if isinstance(data, dict) and "users" in data else data
+                FILES = data.get("files", {}) if isinstance(data, dict) and "files" in data else {}
+        except:
+            USERS, FILES = {}, {}
+
+def save_data():
+    try:
+        with open(DATA_FILE, 'w', encoding='utf-8') as f:
+            json.dump({"users": USERS, "files": FILES}, f, indent=2, ensure_ascii=False, default=str)
+    except Exception as e:
+        print(f"Save error {e}")
+
+load_data()
+
+def get_user(uid):
+    uid = str(uid)
+    if uid not in USERS:
+        USERS[uid] = {"balance": 0.50, "vip": False, "expire": None, "refs": 0, "daily": None, "earned": 0, "uploads": 0, "vault": []}
+        save_data()
+    return USERS[uid]
+
+# ============ البداية ============
+async def handle_start_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # اذا داخل من رابط ملف
+    if context.args and context.args[0].startswith("file_"):
+        code = context.args[0].replace("file_", "")
+        if code in FILES:
+            f = FILES[code]
+            f["downloads"] = f.get("downloads", 0) + 1
+            save_data()
+            await update.message.reply_text(f"📁 **تحميل:** {f['name']}\n👁️ التحميلات: {f['downloads']}")
+            try:
+                await context.bot.send_document(update.effective_user.id, f["file_id"], caption=f"📄 {f['name']}")
+            except:
+                await context.bot.send_photo(update.effective_user.id, f["file_id"])
+            return
+    await start(update, context)
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.effective_user.id)
+    args = context.args
+
+    # نظام الدعوة 1$ لكل شخص
+    if args and not args[0].startswith("file_") and args[0] in USERS and args[0]!= uid:
+        if uid not in USERS:
+            USERS[args[0]]["balance"] += 1.0
+            USERS[args[0]]["refs"] += 1
+            USERS[args[0]]["earned"] += 1.0
+            save_data()
+            try: await context.bot.send_message(int(args[0]), f"🎉 شخص جديد دخل عن طريقك! ربحت 1.00$ 💰")
+            except: pass
+
+    u = get_user(update.effective_user.id)
+    vip_txt = f"👑 VIP حتى {u['expire'][:10]}" if u['vip'] and u['expire'] else "❌ VIP غير مفعل"
+
+    txt = f"""
+🔥 **أهلاً {update.effective_user.first_name}!** 🔥
+
+يسعدنا أنك اخترت خدمتنا استمتع معنا ❤️
+
+💰 **رصيدك:** `${u['balance']:.2f}` | 🎁 هدية 0.50$
+{vip_txt}
+👥 دعواتك: {u['refs']} | 📁 ملفاتك: {u['uploads']}
+
+👇 **اختر الخدمة:**
+"""
+    kb = [
+        [InlineKeyboardButton("📁 رفع ملف (استضافة دائمة) 🔥", callback_data="upload")],
+        [InlineKeyboardButton("🛒 متجر المتابعين", callback_data="shop"), InlineKeyboardButton("🔐 خزنتي", callback_data="vault")],
+        [InlineKeyboardButton("🎁 بونص يومي", callback_data="daily"), InlineKeyboardButton("🔗 رابط دعوتي 1$", callback_data="ref")],
+        [InlineKeyboardButton("💎 ترقية VIP - 10$ 👑", callback_data="vip"), InlineKeyboardButton("💵 شحن / سحب", callback_data="wallet")],
+        [InlineKeyboardButton("👤 حسابي وملفاتي", callback_data="profile")],
+    ]
+    if update.effective_user.id == ADMIN_ID:
+        kb.append([InlineKeyboardButton("⚙️ لوحة الادمن", callback_data="admin")])
+
+    if update.message:
+        await update.message.reply_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+    else:
+        try:
+            await update.callback_query.message.edit_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+        except:
+            await update.callback_query.message.reply_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+
+# ============ رفع الملفات ============
+async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.effective_user.id)
+    u = get_user(uid)
+    cost = 0 if u['vip'] else 0.10
+
+    if u['uploads'] >= 3 and not u['vip']:
+        await update.message.reply_text("❌ وصلت الحد المجاني (3 ملفات).\n👑 اشترك VIP لرفع غير محدود!", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("👑 ترقية VIP", callback_data="vip")]]))
+        return
+    if u['balance'] < cost:
+        await update.message.reply_text(f"❌ رصيدك لا يكفي! تحتاج ${cost}"); return
+
+    doc = update.message.document or update.message.video or update.message.audio
+    photo = update.message.photo[-1] if update.message.photo else None
+    file_obj = doc or photo
+    if not file_obj:
+        return
+
+    code = ''.join(random.choices(string.ascii_letters+string.digits, k=8))
+    fname = getattr(file_obj, 'file_name', 'photo.jpg') if doc else 'photo.jpg'
+
+    FILES[code] = {"owner": uid, "file_id": file_obj.file_id, "name": fname, "date": datetime.now().isoformat(), "downloads": 0}
+    u['balance'] -= cost
+    u['uploads'] += 1
+    save_data()
+
+    botname = (await context.bot.get_me()).username
+    link = f"https://t.me/{botname}?start=file_{code}"
+
+    await update.message.reply_text(f"✅ **تم الرفع!**\n\n📄 {fname}\n🔗 رابط دائم:\n`{link}`\n\n💵 رصيدك: ${u['balance']:.2f}\nارسل الرابط لأي شخص ليحمل!", parse_mode="Markdown")
+
+# ============ ترحيب الجروب ============
+async def welcome_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    for member in update.message.new_chat_members:
+        if member.id == context.bot.id:
+            await update.message.reply_text(
+                "🎉 **أهلاً وسهلاً بكم في البوت!** 🎉\n\n"
+                "يسعدنا أنك اخترت خدمتنا استمتع معنا ❤️\n"
+                "📁 استضافة ملفات دائمة\n"
+                "🛒 خدمات سوشيال ميديا\n"
+                "💰 اربح 1$ على كل صديق تدعوه\n\n"
+                "👇 ارسل /start في الخاص لتبدأ!"
+            )
+        else:
+            await update.message.reply_text(
+                f"👋 أهلاً وسهلاً بك {member.first_name} في البوت!\n\n"
+                "يسعدنا أنك اخترت خدمتنا استمتع معنا 🥰\n"
+                f"🔗 جرب البوت: @{(await context.bot.get_me()).username} وارسل /start"
+            )
+
+async def group_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type in ["group", "supergroup"]:
+        await update.message.reply_text("🤖 البوت شغال! ارسل /start في الخاص عشان تفتح المتجر.")
+
+# ============ الازرار ============
+async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = str(q.from_user.id)
+    u = get_user(uid)
+
+    if q.data == "upload":
+        await q.message.edit_text("📁 **استضافة ملفات مدفوعة**\n\nارسل أي ملف الآن (PDF, ZIP, فيديو...)\n\n💰 السعر: 0.10$ (مجانا للـ VIP)\n♾️ VIP: غير محدود\n\n👇 ارسل الملف الآن:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="back")]])); return
+    if q.data == "vault":
+        context.user_data["await_vault"] = True
+        await q.message.edit_text("🔐 **خزنتك المشفرة**\n\nارسل أي نص تبي تحفظه (باسورد، ملاحظة)\n\nارسل النص الآن:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📜 عرض خزنتي", callback_data="show_vault")],[InlineKeyboardButton("🔙 رجوع", callback_data="back")]])); return
+    if q.data == "show_vault":
+        vault = u.get("vault", [])
+        txt = "🔐 **خزنتك:**\n\n" + "\n".join([f"{i+1}. {v}" for i,v in enumerate(vault[-10:])]) if vault else "خزنتك فارغة"
+        await q.message.edit_text(txt, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="back")]])); return
+    if q.data == "daily":
+        today = datetime.now().strftime("%Y-%m-%d")
+        if u["daily"] == today:
+            await q.answer("❌ اخذته اليوم!", show_alert=True); return
+        u["balance"] += 0.25; u["daily"] = today; save_data()
+        await q.answer("✅ ربحت 0.25$!", show_alert=True); await start(update, context); return
+    if q.data == "ref":
+        bot = (await context.bot.get_me()).username
+        link = f"https://t.me/{bot}?start={uid}"
+        await q.message.edit_text(f"🔗 **رابطك:**\n`{link}`\n\nكل شخص يدخل = **1$** 💰", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="back")]]), parse_mode="Markdown"); return
+    if q.data == "shop":
+        kb = [[InlineKeyboardButton("🔥 1K انستا - 1.5$", callback_data="buy")],[InlineKeyboardButton("👁️ 10K تيك توك - 1$", callback_data="buy")],[InlineKeyboardButton("📁 10 رفعات - 0.8$", callback_data="buy_files")],[InlineKeyboardButton("🔙 رجوع", callback_data="back")]]
+        await q.message.edit_text("🛒 **المتجر:**", reply_markup=InlineKeyboardMarkup(kb)); return
+    if q.data == "buy_files":
+        if u["balance"] >= 0.8:
+            u["balance"] -= 0.8; u["uploads"] = max(0, u["uploads"]-10); save_data()
+            await q.answer("✅ تم شراء 10 رفعات!", show_alert=True)
+        else: await q.answer("رصيدك لا يكفي!", show_alert=True)
+        return
+    if q.data == "buy":
+        if u["balance"] >= 1.0:
+            u["balance"] -= 1.0; save_data()
+            await q.message.edit_text(f"✅ تم الطلب! ID: {uid}\nتواصل مع الادمن للتفعيل\nرصيدك: ${u['balance']:.2f}")
+        else: await q.answer("رصيدك لا يكفي!", show_alert=True)
+        return
+    if q.data == "vip":
+        await q.message.edit_text("👑 **VIP بـ 10$**\n\n✅ رفع غير محدود\n✅ خصم 50%\n✅ خزنة كبيرة\n\nللاشتراك: @YourAdmin", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📞 اشتراك VIP", url=f"tg://user?id={ADMIN_ID}")],[InlineKeyboardButton("🔙 رجوع", callback_data="back")]])); return
+    if q.data == "wallet":
+        await q.message.edit_text(f"💰 **محفظتك:** ${u['balance']:.2f}\n\nللشحن/السحب تواصل: {ADMIN_ID}\nالحد الادنى للسحب 5$", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="back")]])); return
+    if q.data == "profile":
+        myfiles = [f"• {v['name']} - {v['downloads']} تحميل" for k,v in FILES.items() if v['owner']==uid]
+        txt = f"👤 **حسابك:**\n💵 ${u['balance']:.2f}\n📁 {len(myfiles)} ملف\n\n" + ("\n".join(myfiles[:5]) if myfiles else "لا يوجد ملفات")
+        await q.message.edit_text(txt, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="back")]])); return
+    if q.data == "admin":
+        await q.message.edit_text(f"⚙️ **ادمن:**\n👥 المستخدمين: {len(USERS)}\n📁 الملفات: {len(FILES)}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="back")]])); return
+    if q.data == "back":
+        await start(update, context); return
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("await_vault"):
+        u = get_user(update.effective_user.id)
+        u["vault"].append(update.message.text[:500])
+        save_data()
+        context.user_data["await_vault"] = False
+        await update.message.reply_text("✅ تم حفظه في خزنتك!")
+        return
+    # اذا كتب في الجروب
+    if update.effective_chat.type in ["group", "supergroup"]:
+        return
+
+# ============ تشغيل ============
+flask_app = Flask(__name__)
+app = flask_app # عشان gunicorn
+
+@flask_app.route('/')
+def home(): return "Bot + File Hosting + Group Welcome ✅ Running"
+
+def run_flask():
+    flask_app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+
+def run_bot():
+    application = ApplicationBuilder().token(TOKEN).build()
+    application.add_handler(CommandHandler("start", handle_start_file))
+    application.add_handler(CommandHandler("help", group_help))
+    application.add_handler(CallbackQueryHandler(buttons))
+    application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_group))
+    application.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO | filters.VIDEO | filters.AUDIO, handle_file))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    print("Bot Started...")
+    application.run_polling()
+
+if __name__ == "__main__":
+    threading.Thread(target=run_flask, daemon=True).start()
+    run_bot()
